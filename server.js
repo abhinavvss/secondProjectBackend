@@ -430,13 +430,14 @@ app.post("/agent/audio", upload.single('audio'), async (req, res) => {
     console.log(`Audio converted to base64, length: ${audioBase64.length}, MIME type: ${mimeType}`);
 
     // Transcribe audio using Gemini with retry logic for quota errors
-   // REVISED LIST: Prioritize stable models that support audio
-   const modelsToTry = [
-    "gemini-1.5-flash",      // BEST for audio & speed (Stable)
-    "gemini-1.5-pro",        // Good alternative (Stable)
-    "gemini-2.0-flash-exp",  // Experimental (Often hits quota limits)
-    "gemini-2.0-flash"       // Experimental
-  ];
+    // Use the same model as text generation first (it's working for text)
+    // Then try other models that support free tier
+    const modelsToTry = [
+      "gemini-2.5-flash-lite",  // Same as text generation - should work
+      "gemini-1.5-flash-8b",    // Free tier supported variant
+      "gemini-1.5-flash",       // Standard flash
+      "gemini-1.5-pro"         // Pro model
+    ];
 
     let transcriptionResult = null;
     let lastError = null;

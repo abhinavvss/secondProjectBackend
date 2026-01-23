@@ -3,10 +3,18 @@ dotenv.config();
 import bodyParser from "body-parser";
 import { v4 as uuid } from "uuid";
 import util from "util";
+import multer from "multer";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 
 import express from "express";
 import routes from "./routes.js";
 import cors from "cors";
+
+// Configure multer for memory storage
+const upload = multer({ 
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit
+});
 
 // Text extraction utility - removes helping verbs and phrases
 function extractCleanValue(text, fieldName) {
@@ -217,6 +225,8 @@ app.post("/agent/start", (req, res) => {
   const totalRequiredFields = formDefinition.filter(f => f.isRequired).length;
   
   let initialMessage = "Hi there! 👋 I'm here to help you fill out this form. ";
+  let options = null;
+  let optionType = null;
   
   // Set lastAskedFieldId if we're asking about a field
   if (firstRequiredField) {
@@ -224,11 +234,21 @@ app.post("/agent/start", (req, res) => {
     if (session) {
       session.lastAskedFieldId = firstRequiredField.id;
     }
+    
+    // Use buildAskResponse to get the proper question and options
+    const askResponse = buildAskResponse(firstRequiredField, null);
     const fieldName = firstRequiredField.fieldName.toLowerCase();
+    
     if (totalRequiredFields === 1) {
-      initialMessage += `I just need one piece of information from you. What's the ${fieldName}?`;
+      initialMessage += `I just need one piece of information from you. ${askResponse.chat}`;
     } else {
-      initialMessage += `I'll guide you through ${totalRequiredFields} required fields. Let's start with the ${fieldName} - what would you like to tell me about that?`;
+      initialMessage += `I'll guide you through ${totalRequiredFields} required fields. Let's start - ${askResponse.chat}`;
+    }
+    
+    // Include options if the field has them (dropdown, checkbox, checklist)
+    if (askResponse.ui?.options && askResponse.ui.options.length > 0) {
+      options = askResponse.ui.options;
+      optionType = askResponse.ui.type;
     }
   } else {
     initialMessage += "This form doesn't have any required fields. How can I help you get started?";
@@ -237,6 +257,11 @@ app.post("/agent/start", (req, res) => {
   return res.json({
     sessionId,
     message: initialMessage,
+    ui: {
+      text: initialMessage,
+      options: options,
+      type: optionType
+    }
   });
 });
 
@@ -293,6 +318,75 @@ app.post("/agent/step", async (req, res) => {
       error: "Internal server error",
       type: "CHAT",
       ui: { text: "Sorry, something went wrong. Please try again." }
+    });
+  }
+});
+
+// Audio message endpoint - accepts audio file and transcribes it
+app.post("/agent/audio", upload.single('audio'), async (req, res) => {
+  try {
+    const { sessionId } = req.body;
+    const audioFile = req.file;
+
+    if (!audioFile) {
+      return res.status(400).json({ error: "No audio file provided" });
+    }
+
+    const session = sessions.get(sessionId);
+    if (!session) {
+      return res.status(404).json({ error: "Invalid session" });
+    }
+
+    console.log(`Received audio file: ${audioFile.mimetype}, size: ${audioFile.size} bytes`);
+
+    // Initialize Gemini for audio transcription
+    const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+
+    // Convert audio buffer to base64
+    const audioBase64 = audioFile.buffer.toString('base64');
+
+    // Transcribe audio using Gemini
+    const transcriptionResult = await model.generateContent([
+      {
+        inlineData: {
+          mimeType: audioFile.mimetype,
+          data: audioBase64
+        }
+      },
+      { text: "Transcribe this audio exactly. Return ONLY the transcribed text, nothing else. If the audio is unclear or empty, return an empty string." }
+    ]);
+
+    const transcribedText = transcriptionResult.response.text().trim();
+    console.log(`Transcribed text: "${transcribedText}"`);
+
+    if (!transcribedText) {
+      return res.json({
+        type: "CHAT",
+        ui: {
+          text: "I couldn't understand the audio. Could you please try again or type your message?"
+        },
+        transcribedText: ""
+      });
+    }
+
+    // Add transcribed message to conversation
+    session.conversation.push({ role: "user", text: transcribedText });
+
+    // Process the transcribed message through the agent
+    const agentDecision = await runAgent(session);
+
+    // Include the transcribed text in response for frontend display
+    return res.json({
+      ...agentDecision,
+      transcribedText
+    });
+  } catch (error) {
+    console.error("Error in /agent/audio:", error);
+    return res.status(500).json({ 
+      error: "Failed to process audio",
+      type: "CHAT",
+      ui: { text: "Sorry, I couldn't process the audio. Please try again or type your message." }
     });
   }
 });
@@ -392,7 +486,8 @@ async function runAgent(session) {
               form: finalUpdatedForm,
               ui: {
                 text: `Got it! I've filled in ${lastAskedField.fieldName}. ${nextFieldQuestion.chat}`,
-                options: nextFieldQuestion.ui?.options || null
+                options: nextFieldQuestion.ui?.options || null,
+                type: nextFieldQuestion.ui?.type || null
               }
             };
           } else {
@@ -587,7 +682,8 @@ async function runAgent(session) {
             form: updatedForm,
             ui: {
               text: `Great! I've filled in ${fieldName}. ${nextFieldQuestion.chat}`,
-              options: nextFieldQuestion.ui?.options || null
+              options: nextFieldQuestion.ui?.options || null,
+              type: nextFieldQuestion.ui?.type || null
             }
           };
         }
@@ -622,7 +718,8 @@ async function runAgent(session) {
           type: askResponse.type,
           ui: {
             text: askResponse.chat,
-            options: askResponse.ui?.options || null
+            options: askResponse.ui?.options || null,
+            type: askResponse.ui?.type || null
           }
         };
 
@@ -932,6 +1029,7 @@ function buildAskResponse(field, conversationalQuestion = null) {
       };
 
     case "CHECKBOX":
+    case "CHECKBOX_GROUP":
       return {
         type: "ASK",
         chat: getQuestion(`Which of these apply for ${field.fieldName.toLowerCase()}?`),

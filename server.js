@@ -686,8 +686,31 @@ async function runAgent(session) {
       }
     }
 
+    // Check if message contains multiple fields - if so, skip fallback and let AI extract all
+    const messageLower = lastUserMessage.toLowerCase();
+    // Count how many field-related keywords are mentioned
+    const fieldKeywords = ['chief', 'name', 'description', 'desc', 'date', 'time', 'location', 'cause', 'severity', 'type'];
+    const mentionedFields = fieldKeywords.filter(keyword => messageLower.includes(keyword)).length;
+
+    // Also check for patterns like "X is Y, Z is W" or "X: Y, Z: W"
+    const hasMultipleAssignments = (
+      (messageLower.match(/\w+\s+(is|are|was|were)\s+/g) || []).length >= 2 ||
+      (lastUserMessage.match(/,/g) || []).length >= 1 && (messageLower.includes('is') || messageLower.includes('are'))
+    );
+
+    const hasMultipleFieldIndicators = lastUserMessage && (
+      mentionedFields >= 2 || // Multiple field keywords mentioned
+      hasMultipleAssignments || // Multiple "is/are" patterns
+      (messageLower.includes(' and ') && (messageLower.includes('is') || messageLower.includes('are'))) // "X and Y is/are"
+    );
+
+    if (hasMultipleFieldIndicators) {
+      console.log(`Detected multiple fields in message, skipping fallback to let AI extract all fields`);
+    }
+
     // AGGRESSIVE FALLBACK: If we asked about a field and user provided a substantial response, force SET_FIELD
-    if (session.lastAskedFieldId && lastUserMessage) {
+    // BUT: Skip this if message contains multiple fields - let AI extract all of them
+    if (session.lastAskedFieldId && lastUserMessage && !hasMultipleFieldIndicators) {
       const lastAskedField = session.formDefinition.find(f => f.id === session.lastAskedFieldId);
       if (lastAskedField && !session.formState[session.lastAskedFieldId]) {
         // Check if message is a simple greeting/question word (exact match only, case insensitive)
@@ -866,15 +889,18 @@ async function runAgent(session) {
               }
             }
 
-            // Validate dropdown values
+            // Validate dropdown values - MUST match exactly
             if (fieldToUpdate.fieldType === "DROPDOWN" && fieldToUpdate.dropDownOptions) {
               const matchingOption = fieldToUpdate.dropDownOptions.find(
                 opt => opt.toLowerCase() === String(fieldValue).toLowerCase()
               );
               if (matchingOption) {
-                fieldValue = matchingOption;
+                fieldValue = matchingOption; // Use exact option from list
               } else if (fieldToUpdate.dropDownOptions.length > 0) {
-                console.warn(`Dropdown value "${fieldValue}" doesn't match options for ${fieldToUpdate.fieldName}`);
+                console.error(`❌ INVALID DROPDOWN VALUE: "${fieldValue}" doesn't match any option for ${fieldToUpdate.fieldName}`);
+                console.error(`Available options: ${fieldToUpdate.dropDownOptions.join(", ")}`);
+                // Skip this field - don't fill it with invalid value
+                continue; // Skip to next action
               }
             }
 
@@ -930,7 +956,8 @@ async function runAgent(session) {
     }
 
     // Secondary fallback: If AI still returned MESSAGE/ASK_FIELD but we have a lastAskedField, force SET_FIELD
-    if ((decision.action === "MESSAGE" || decision.action === "ASK_FIELD") && session.lastAskedFieldId && lastUserMessage) {
+    // BUT: Skip this if message contains multiple fields - let AI extract all of them
+    if ((decision.action === "MESSAGE" || decision.action === "ASK_FIELD") && session.lastAskedFieldId && lastUserMessage && !hasMultipleFieldIndicators) {
       const lastAskedField = session.formDefinition.find(f => f.id === session.lastAskedFieldId);
       if (lastAskedField && !session.formState[session.lastAskedFieldId]) {
         const trimmedMessage = lastUserMessage.trim();
@@ -1024,7 +1051,7 @@ async function runAgent(session) {
           }
         }
 
-        // Validate dropdown values
+        // Validate dropdown values - MUST match exactly
         if (fieldToUpdate.fieldType === "DROPDOWN" && fieldToUpdate.dropDownOptions) {
           // Check if value matches one of the options (case-insensitive)
           const matchingOption = fieldToUpdate.dropDownOptions.find(
@@ -1033,8 +1060,15 @@ async function runAgent(session) {
           if (matchingOption) {
             fieldValue = matchingOption; // Use the exact option from the list
           } else if (fieldToUpdate.dropDownOptions.length > 0) {
-            console.warn(`Dropdown value "${fieldValue}" doesn't match options. Available: ${fieldToUpdate.dropDownOptions.join(", ")}`);
-            // Still store it, but log a warning
+            console.error(`❌ INVALID DROPDOWN VALUE: "${fieldValue}" doesn't match any option for ${fieldToUpdate.fieldName}`);
+            console.error(`Available options: ${fieldToUpdate.dropDownOptions.join(", ")}`);
+            // Return error - don't fill with invalid value
+            return {
+              type: "CHAT",
+              ui: {
+                text: `I couldn't find "${fieldValue}" in the options for ${fieldToUpdate.fieldName}. Please choose from: ${fieldToUpdate.dropDownOptions.join(", ")}`
+              }
+            };
           }
         }
 
@@ -1330,10 +1364,13 @@ function buildPrompt(session) {
   return `
 You are a warm, friendly, and helpful human-like assistant helping someone fill out a form. Think of yourself as a helpful colleague or friend, not a robot. Be empathetic, encouraging, and make the process feel natural and conversational.
 
+🚨 MOST IMPORTANT RULE - READ THIS FIRST:
+If the LAST USER MESSAGE contains information for MULTIPLE fields (e.g., "chief name is X, description is Y, date is Z"), you MUST extract ALL of them and return an "actions" array with multiple SET_FIELD actions. DO NOT just fill the LAST ASKED FIELD - extract ALL fields mentioned in the message.
+
 ⚠️ CRITICAL RULES - READ THIS FIRST (IN PRIORITY ORDER):
-1. HIGHEST PRIORITY: If the user provides information for MULTIPLE fields in one message, extract ALL of them and return multiple SET_FIELD actions using the "actions" array format
-2. SECOND PRIORITY: If "LAST ASKED FIELD" below is NOT "None" AND the last user message is NOT a greeting (hi/hello/hey) or question word, you MUST use SET_FIELD action immediately for that field
-3. If user provides information for multiple fields, ALWAYS extract all of them - don't just fill the LAST ASKED FIELD
+1. HIGHEST PRIORITY: Scan the ENTIRE LAST USER MESSAGE for ALL field information. If it mentions multiple fields, extract ALL of them using "actions" array format
+2. SECOND PRIORITY: If message contains only ONE field value and "LAST ASKED FIELD" is set, use SET_FIELD for that field
+3. NEVER fill only the LAST ASKED FIELD if the message contains information for multiple fields - extract ALL of them
 
 FORM DEFINITION:
 ${JSON.stringify(session.formDefinition)}
@@ -1398,6 +1435,13 @@ CRITICAL EXTRACTION RULES (HIGHEST PRIORITY - FOLLOW IN THIS ORDER):
 
 3. THIRD: If LAST ASKED FIELD exists and message is a simple answer (not mentioning multiple fields), use SET_FIELD for that field
 
+⚠️ CRITICAL: DROPDOWN FIELDS - MUST USE EXACT OPTIONS:
+- For DROPDOWN fields, you MUST check the dropDownOptions array in FORM DEFINITION
+- The value you extract MUST exactly match one of the options (case-insensitive matching is OK, but use the exact option from the list)
+- If user says something that doesn't match any option, DO NOT fill the field - ask them to choose from the available options
+- Example: If Location Type has options ["Residential", "Commercial", "Industrial"] and user says "house", you should NOT fill it - ask them to choose from the list
+- Example: If user says "residential" and options are ["Residential", "Commercial"], use "Residential" (exact match from list)
+
 IMPORTANT: User messages are ALREADY TRANSLATED TO ENGLISH (even if originally in Punjabi/Hindi)
 - Always extract values in English for the form
 - Don't ask "Is that correct?" or "Can you confirm?" - just fill it and move on
@@ -1439,6 +1483,15 @@ ACTION RULES (IN ORDER OF PRIORITY):
    - This is the MOST IMPORTANT rule - extract ALL values mentioned in the message
    - Don't ask for confirmation, don't ask follow-up questions - just fill it
    - Include fieldId (exact ID from FORM DEFINITION), value (extracted value), and fieldLabel (field name) in payload
+
+   ⚠️ CRITICAL FOR DROPDOWN FIELDS:
+   - Before setting a DROPDOWN field value, check the dropDownOptions array in FORM DEFINITION
+   - The value MUST exactly match one of the options (case-insensitive is OK, but return the exact option from list)
+   - If user's input doesn't match any option, DO NOT use SET_FIELD - instead use ASK_FIELD to show them the options
+   - Example: Location Type has options ["Residential", "Commercial", "Industrial"]
+     * User says "residential" → Use "Residential" (exact match from list) in SET_FIELD
+     * User says "house" → DO NOT fill, use ASK_FIELD to show options
+
    - Example: User says "Chief Name is Sukhman, Description is blah blah, date is today"
      → Return: { "actions": [
          { "action": "SET_FIELD", "payload": { "fieldId": "chief-id", "value": "Sukhman", "fieldLabel": "Fire Chief Name" } },
@@ -1489,7 +1542,18 @@ CRITICAL RULES (FOLLOW IN THIS ORDER):
 7. Be proactive - don't wait for the user, guide them through the process
 
 EXAMPLES OF CORRECT BEHAVIOR:
-- You ask: "What's the Fire Chief Name?" → User: "Abhinav" → RESPONSE: { "action": "SET_FIELD", "payload": { "fieldId": "f2fb1543-c333-4803-9cdb-679530e66c32", "value": "Abhinav", "fieldLabel": "Fire Chief Name" } }
+- User says: "Please fill the report, chief name Sukhamand, description blah blah blah"
+  → RESPONSE: { "actions": [
+      { "action": "SET_FIELD", "payload": { "fieldId": "chief-id", "value": "Sukhamand", "fieldLabel": "Fire Chief Name" } },
+      { "action": "SET_FIELD", "payload": { "fieldId": "desc-id", "value": "blah blah blah", "fieldLabel": "Description" } }
+    ] }
+- User says: "Chief Name is Sukhman, Description is blah blah, date is today"
+  → RESPONSE: { "actions": [
+      { "action": "SET_FIELD", "payload": { "fieldId": "chief-id", "value": "Sukhman", "fieldLabel": "Fire Chief Name" } },
+      { "action": "SET_FIELD", "payload": { "fieldId": "desc-id", "value": "blah blah", "fieldLabel": "Description" } },
+      { "action": "SET_FIELD", "payload": { "fieldId": "date-id", "value": "2024-01-15T00:00:00", "fieldLabel": "Date" } }
+    ] }
+- You ask: "What's the Fire Chief Name?" → User: "Abhinav" (only one value) → RESPONSE: { "action": "SET_FIELD", "payload": { "fieldId": "f2fb1543-c333-4803-9cdb-679530e66c32", "value": "Abhinav", "fieldLabel": "Fire Chief Name" } }
 - You ask: "What's the date?" → User: "March 2" → RESPONSE: { "action": "SET_FIELD", "payload": { "fieldId": "date-field-id", "value": "2024-03-02T00:00:00", "fieldLabel": "Date of Incident" } }
 - User says "Hi" (greeting) → RESPONSE: { "action": "MESSAGE", "payload": { "text": "Hello! Let's continue. What's the [next field]?" } }
 - All required done: { "action": "ASK_OPTIONAL_CONTINUE", "payload": { "text": "Excellent! All required fields are complete. Would you like to add any optional information, or are you ready to submit?" } }

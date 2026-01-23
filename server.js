@@ -459,7 +459,7 @@ app.post("/agent/audio", upload.single('audio'), async (req, res) => {
                 data: audioBase64
               }
             },
-            { text: "Transcribe this audio exactly. The audio may be in Punjabi, Hindi, or English. Transcribe it in the same language it was spoken. Return ONLY the transcribed text in the original language, nothing else. If the audio is unclear or empty, return an empty string." }
+            { text: "Transcribe this audio and translate it to English. The audio may be in Punjabi, Hindi, or English. If the audio is in Punjabi or Hindi, translate it to English. If it's already in English, keep it in English. Return ONLY the English transcribed/translated text, nothing else. If the audio is unclear or empty, return an empty string." }
           ]);
           console.log(`Successfully transcribed with model: ${modelName}`);
           success = true;
@@ -838,6 +838,96 @@ async function runAgent(session) {
 
     const decision = await callGemini(prompt);
     console.log(util.inspect({decision}, { depth: null, colors: true }));
+
+    // Handle multiple actions (fill entire form in one go)
+    if (decision.actions && Array.isArray(decision.actions)) {
+      console.log(`Processing ${decision.actions.length} actions to fill multiple fields at once`);
+      let lastResponse = null;
+      let allFieldsFilled = [];
+
+      for (const action of decision.actions) {
+        if (action.action === "SET_FIELD") {
+          // Process each SET_FIELD action
+          const fieldToUpdate = session.formDefinition.find(f => f.id === action.payload.fieldId);
+          if (fieldToUpdate) {
+            let fieldValue = action.payload.value;
+
+            // Extract clean value for text fields
+            if (fieldToUpdate.fieldType === "SINGLE_LINE_TEXT" || fieldToUpdate.fieldType === "MULTI_LINE_TEXT") {
+              fieldValue = extractCleanValue(fieldValue, fieldToUpdate.fieldName);
+            }
+
+            // Parse and format date fields
+            if (fieldToUpdate.fieldType === "DATE" || fieldToUpdate.fieldType === "DATE_AND_TIME") {
+              const formattedDate = parseAndFormatDate(fieldValue, fieldToUpdate.fieldType);
+              if (formattedDate) {
+                fieldValue = formattedDate;
+                console.log(`Formatted date from "${action.payload.value}" to "${fieldValue}"`);
+              }
+            }
+
+            // Validate dropdown values
+            if (fieldToUpdate.fieldType === "DROPDOWN" && fieldToUpdate.dropDownOptions) {
+              const matchingOption = fieldToUpdate.dropDownOptions.find(
+                opt => opt.toLowerCase() === String(fieldValue).toLowerCase()
+              );
+              if (matchingOption) {
+                fieldValue = matchingOption;
+              } else if (fieldToUpdate.dropDownOptions.length > 0) {
+                console.warn(`Dropdown value "${fieldValue}" doesn't match options for ${fieldToUpdate.fieldName}`);
+              }
+            }
+
+            session.formState[action.payload.fieldId] = fieldValue;
+            session.lastAskedFieldId = null; // Clear since we filled it
+            allFieldsFilled.push(action.payload.fieldLabel || fieldToUpdate.fieldName);
+            console.log(`Setting field ${fieldToUpdate.fieldName} (${action.payload.fieldId}) = ${fieldValue}`);
+          }
+        }
+      }
+
+      // Build updated form for response
+      const updatedForm = session.formDefinition.map(field => {
+        const storedValue = session.formState[field.id];
+        return {
+          ...field,
+          fieldValue: (field.fieldType === "SINGLE_LINE_TEXT" || field.fieldType === "MULTI_LINE_TEXT") ? storedValue || null : null,
+          selectedDropdownOption: field.fieldType === "DROPDOWN" ? storedValue || null : null,
+          selectedCheckboxOptions: field.fieldType === "CHECKBOX" ? (Array.isArray(storedValue) ? storedValue : storedValue ? [storedValue] : null) : null,
+          selectedChecklistOptions: field.fieldType === "CHECKLIST" ? (Array.isArray(storedValue) ? storedValue : storedValue ? [storedValue] : null) : null,
+          dateAndTimeValue: (field.fieldType === "DATE" || field.fieldType === "DATE_AND_TIME") ? storedValue || null : null
+        };
+      });
+
+      // Check if all required fields are now filled
+      const requiredFields = session.formDefinition.filter(f => f.isRequired);
+      const unfilledRequiredFields = requiredFields.filter(f => !session.formState[f.id]);
+
+      if (unfilledRequiredFields.length === 0) {
+        // All required fields filled
+        return {
+          type: "FORM_UPDATE",
+          form: updatedForm,
+          ui: {
+            text: `Perfect! I've filled in all the fields: ${allFieldsFilled.join(", ")}. Your form is complete! 🎉`
+          }
+        };
+      } else {
+        // Some fields still need to be filled
+        const nextField = unfilledRequiredFields[0];
+        session.lastAskedFieldId = nextField.id; // Set next field to ask about
+        const nextFieldQuestion = buildAskResponse(nextField, null);
+        return {
+          type: "FORM_UPDATE",
+          form: updatedForm,
+          ui: {
+            text: `Great! I've filled in: ${allFieldsFilled.join(", ")}. ${nextFieldQuestion.chat}`,
+            options: nextFieldQuestion.ui?.options || null,
+            type: nextFieldQuestion.ui?.type || null
+          }
+        };
+      }
+    }
 
     // Secondary fallback: If AI still returned MESSAGE/ASK_FIELD but we have a lastAskedField, force SET_FIELD
     if ((decision.action === "MESSAGE" || decision.action === "ASK_FIELD") && session.lastAskedFieldId && lastUserMessage) {
@@ -1240,8 +1330,10 @@ function buildPrompt(session) {
   return `
 You are a warm, friendly, and helpful human-like assistant helping someone fill out a form. Think of yourself as a helpful colleague or friend, not a robot. Be empathetic, encouraging, and make the process feel natural and conversational.
 
-⚠️ CRITICAL RULE - READ THIS FIRST:
-If "LAST ASKED FIELD" below is NOT "None" AND the last user message is NOT a greeting (hi/hello/hey) or question word, you MUST use SET_FIELD action immediately. Do NOT ask the question again. Do NOT use MESSAGE. Use SET_FIELD with the LAST ASKED FIELD's id.
+⚠️ CRITICAL RULES - READ THIS FIRST (IN PRIORITY ORDER):
+1. HIGHEST PRIORITY: If the user provides information for MULTIPLE fields in one message, extract ALL of them and return multiple SET_FIELD actions using the "actions" array format
+2. SECOND PRIORITY: If "LAST ASKED FIELD" below is NOT "None" AND the last user message is NOT a greeting (hi/hello/hey) or question word, you MUST use SET_FIELD action immediately for that field
+3. If user provides information for multiple fields, ALWAYS extract all of them - don't just fill the LAST ASKED FIELD
 
 FORM DEFINITION:
 ${JSON.stringify(session.formDefinition)}
@@ -1263,12 +1355,17 @@ ${session.lastAskedFieldId ? JSON.stringify(session.formDefinition.find(f => f.i
 
 LAST USER MESSAGE: "${lastUserMsg}"
 
-⚠️ IF LAST ASKED FIELD EXISTS AND LAST USER MESSAGE IS NOT A GREETING:
-- You MUST use SET_FIELD action
-- Use the LAST ASKED FIELD's id as fieldId
-- Use the LAST USER MESSAGE as the value (or extract the value from it)
-- Do NOT use MESSAGE action
-- Do NOT ask the question again
+⚠️ EXTRACTION PRIORITY (MOST IMPORTANT):
+1. FIRST: Scan the ENTIRE LAST USER MESSAGE for ALL field information
+   - If message mentions multiple fields (e.g., "chief name is X, description is Y"), extract ALL of them
+   - Return "actions" array with multiple SET_FIELD actions
+   - Example: "Chief Name is Sukhman, Description is blah blah, date is today" → Extract ALL THREE fields
+
+2. SECOND: If message contains only one field value, extract that field
+   - Use LAST ASKED FIELD as context if it matches
+   - But don't limit yourself - if user mentions a different field, extract that one
+
+3. THIRD: If LAST ASKED FIELD exists and message is a simple answer, use SET_FIELD for that field
 
 CURRENT STATUS:
 - All required fields filled: ${allRequiredFieldsFilled}
@@ -1278,22 +1375,44 @@ CURRENT STATUS:
 
 YOUR BEHAVIOR:
 1. Be warm and human-like - use natural language, show personality, be encouraging
-2. CRITICAL: When user provides a value (like a name, date, or answer), IMMEDIATELY use SET_FIELD - don't ask follow-up questions
-3. After filling a field, acknowledge it warmly and immediately ask about the next required field
-4. Keep the conversation flowing - don't wait for the user, proactively guide them
-5. If user provides information that matches a field, extract it RIGHT AWAY and use SET_FIELD
-6. Show progress: "Great! Just a couple more questions..." or "We're almost done!"
-7. Be empathetic: "I know forms can be tedious, but we're making great progress!"
+2. HIGHEST PRIORITY: When user provides information for MULTIPLE fields in one message, ALWAYS extract ALL of them and fill them ALL at once using "actions" array with multiple SET_FIELD actions
+3. CRITICAL: Scan the entire LAST USER MESSAGE for ALL field information - don't just look at the LAST ASKED FIELD
+4. CRITICAL: When user provides a value (like a name, date, or answer), IMMEDIATELY use SET_FIELD - don't ask follow-up questions
+5. After filling fields, acknowledge warmly and ask about remaining unfilled required fields
+6. Keep the conversation flowing - don't wait for the user, proactively guide them
+7. If user provides information that matches a field, extract it RIGHT AWAY and use SET_FIELD
+8. Show progress: "Great! Just a couple more questions..." or "We're almost done!"
+9. Be empathetic: "I know forms can be tedious, but we're making great progress!"
+10. IMPORTANT: User messages are ALREADY TRANSLATED TO ENGLISH - extract values in English for the form
 
-CRITICAL EXTRACTION RULES (HIGHEST PRIORITY):
-- If LAST ASKED FIELD is set and user responds with a value (not a greeting or question), use SET_FIELD for that field IMMEDIATELY
-- The LAST ASKED FIELD shows you which field the user is likely answering
-- Match the user's response to the LAST ASKED FIELD first, then check other unfilled fields
+CRITICAL EXTRACTION RULES (HIGHEST PRIORITY - FOLLOW IN THIS ORDER):
+1. FIRST AND MOST IMPORTANT: Scan the ENTIRE LAST USER MESSAGE for ALL field information
+   - Look for field names mentioned: "chief name", "description", "date", "location", "cause", etc.
+   - If the message contains information for MULTIPLE fields, extract ALL of them
+   - Return multiple SET_FIELD actions using the "actions" array format
+   - Example: "Chief Name is Sukhman, Description is blah blah, date is today" → Extract ALL THREE fields
+
+2. SECOND: If message contains information for only ONE field, extract that field
+   - Use LAST ASKED FIELD as context, but don't limit yourself to it
+   - If user mentions a field name explicitly, extract that field
+
+3. THIRD: If LAST ASKED FIELD exists and message is a simple answer (not mentioning multiple fields), use SET_FIELD for that field
+
+IMPORTANT: User messages are ALREADY TRANSLATED TO ENGLISH (even if originally in Punjabi/Hindi)
+- Always extract values in English for the form
 - Don't ask "Is that correct?" or "Can you confirm?" - just fill it and move on
-- If user provides a value and LAST ASKED FIELD exists, that's almost certainly the field to fill
-- Examples:
-  * LAST ASKED FIELD: Fire Chief Name → User says: "Abhinav" → IMMEDIATELY: { "action": "SET_FIELD", "payload": { "fieldId": "f2fb1543-c333-4803-9cdb-679530e66c32", "value": "Abhinav", "fieldLabel": "Fire Chief Name" } }
-  * LAST ASKED FIELD: Date of Incident → User says: "March 2" → IMMEDIATELY: { "action": "SET_FIELD", "payload": { "fieldId": "6bdfe965-78e9-42af-8f30-b4759f9a635a", "value": "2024-03-02T00:00:00", "fieldLabel": "Date of Incident" } }
+
+Examples:
+  * User says: "Chief Name is Sukhman, Description is blah blah, date is today"
+    → Extract ALL: { "actions": [
+        { "action": "SET_FIELD", "payload": { "fieldId": "chief-id", "value": "Sukhman", "fieldLabel": "Fire Chief Name" } },
+        { "action": "SET_FIELD", "payload": { "fieldId": "desc-id", "value": "blah blah", "fieldLabel": "Description" } },
+        { "action": "SET_FIELD", "payload": { "fieldId": "date-id", "value": "2024-01-15T00:00:00", "fieldLabel": "Date" } }
+      ] }
+  * User says: "The fire chief name is John Smith, date is March 2nd, and the cause was electrical"
+    → Extract ALL three fields using "actions" array
+  * LAST ASKED FIELD: Fire Chief Name → User says: "Abhinav" (only one value)
+    → { "action": "SET_FIELD", "payload": { "fieldId": "f2fb1543-c333-4803-9cdb-679530e66c32", "value": "Abhinav", "fieldLabel": "Fire Chief Name" } }
 
 WORKFLOW:
 PHASE 1 - Required Fields:
@@ -1311,13 +1430,23 @@ PHASE 3 - Optional Fields (if user says yes):
 - Be less pushy - "Would you like to add [field name]?" or "Is there anything else you'd like to include?"
 
 ACTION RULES (IN ORDER OF PRIORITY):
-1. FIRST PRIORITY - SET_FIELD:
-   - If LAST ASKED FIELD exists and LAST USER MESSAGE is not a greeting/question, you MUST use SET_FIELD
-   - If user provides ANY value that matches a field (especially the field you just asked about), use SET_FIELD IMMEDIATELY
-   - This is the MOST IMPORTANT rule - extract values as soon as provided
+1. FIRST PRIORITY - SET_FIELD (can be multiple):
+   - ALWAYS scan the ENTIRE LAST USER MESSAGE first to find ALL field information
+   - If user mentions MULTIPLE fields (e.g., "chief name is X, description is Y, date is Z"), extract ALL of them
+   - Look for field names in the message and match them to FORM DEFINITION fields
+   - Return an "actions" array with multiple SET_FIELD actions to fill all fields at once
+   - If message contains only ONE field value, use single SET_FIELD action
+   - This is the MOST IMPORTANT rule - extract ALL values mentioned in the message
    - Don't ask for confirmation, don't ask follow-up questions - just fill it
    - Include fieldId (exact ID from FORM DEFINITION), value (extracted value), and fieldLabel (field name) in payload
-   - Example: LAST ASKED FIELD = Fire Chief Name, LAST USER MESSAGE = "Abhinav" → { "action": "SET_FIELD", "payload": { "fieldId": "f2fb1543-c333-4803-9cdb-679530e66c32", "value": "Abhinav", "fieldLabel": "Fire Chief Name" } }
+   - Example: User says "Chief Name is Sukhman, Description is blah blah, date is today"
+     → Return: { "actions": [
+         { "action": "SET_FIELD", "payload": { "fieldId": "chief-id", "value": "Sukhman", "fieldLabel": "Fire Chief Name" } },
+         { "action": "SET_FIELD", "payload": { "fieldId": "desc-id", "value": "blah blah", "fieldLabel": "Description" } },
+         { "action": "SET_FIELD", "payload": { "fieldId": "date-id", "value": "2024-01-15T00:00:00", "fieldLabel": "Date" } }
+       ] }
+   - Example: LAST ASKED FIELD = Fire Chief Name, LAST USER MESSAGE = "Abhinav" (only one value)
+     → { "action": "SET_FIELD", "payload": { "fieldId": "f2fb1543-c333-4803-9cdb-679530e66c32", "value": "Abhinav", "fieldLabel": "Fire Chief Name" } }
 
 2. ASK_FIELD: When you need to ask about a specific field - include a conversational "question" in payload
    - Only use this when you're asking a NEW question, not after user provided a value
@@ -1330,6 +1459,7 @@ ACTION RULES (IN ORDER OF PRIORITY):
 5. CONFIRM_FORM: When user wants to submit (either after required fields or after optional fields)
 
 RESPONSE FORMAT (return ONLY valid JSON):
+For single action:
 {
   "action": "MESSAGE" | "SET_FIELD" | "ASK_FIELD" | "ASK_OPTIONAL_CONTINUE" | "CONFIRM_FORM",
   "payload": {
@@ -1339,6 +1469,14 @@ RESPONSE FORMAT (return ONLY valid JSON):
     // For ASK_OPTIONAL_CONTINUE: { "text": "Would you like to fill optional fields or submit?" }
     // For CONFIRM_FORM: {}
   }
+}
+For multiple fields at once (fill entire form in one go):
+{
+  "actions": [
+    { "action": "SET_FIELD", "payload": { "fieldId": "id1", "value": "value1", "fieldLabel": "Field 1" } },
+    { "action": "SET_FIELD", "payload": { "fieldId": "id2", "value": "value2", "fieldLabel": "Field 2" } },
+    { "action": "SET_FIELD", "payload": { "fieldId": "id3", "value": "value3", "fieldLabel": "Field 3" } }
+  ]
 }
 
 CRITICAL RULES (FOLLOW IN THIS ORDER):

@@ -11,9 +11,18 @@ import routes from "./routes.js";
 import cors from "cors";
 
 // Configure multer for memory storage
-const upload = multer({ 
+const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit
+  fileFilter: (req, file, cb) => {
+    // Accept audio files
+    if (file.mimetype.startsWith('audio/')) {
+      cb(null, true);
+    } else {
+      console.warn(`Rejected file with MIME type: ${file.mimetype}`);
+      cb(new Error('Only audio files are allowed'), false);
+    }
+  }
 });
 
 // Text extraction utility - removes helping verbs and phrases
@@ -21,10 +30,10 @@ function extractCleanValue(text, fieldName) {
   if (!text || typeof text !== 'string') {
     return text;
   }
-  
+
   const lower = text.toLowerCase().trim();
   const fieldNameLower = fieldName.toLowerCase();
-  
+
   // Common patterns to remove
   const patterns = [
     // Name patterns
@@ -42,7 +51,7 @@ function extractCleanValue(text, fieldName) {
     new RegExp(`^(it|that|this)\\s+(is|was|will be)\\s+(.+)$`, 'i'),
     new RegExp(`^(i|we|they)\\s+(think|believe|know|say|said)\\s+(it\\s+is|that|it)\\s+(.+)$`, 'i'),
   ];
-  
+
   for (const pattern of patterns) {
     const match = text.match(pattern);
     if (match && match[match.length - 1]) {
@@ -53,7 +62,7 @@ function extractCleanValue(text, fieldName) {
       }
     }
   }
-  
+
   // If no pattern matches, return original
   return text.trim();
 }
@@ -75,7 +84,7 @@ function parseAndFormatDate(dateString, fieldType) {
     let date;
     const lower = trimmed.toLowerCase();
     const currentYear = new Date().getFullYear();
-    
+
     // Handle relative dates first
     if (lower.includes('today') || lower === 'today') {
       date = new Date();
@@ -87,11 +96,11 @@ function parseAndFormatDate(dateString, fieldType) {
       date.setDate(date.getDate() + 1);
     } else {
       // Try formats with month names FIRST (before Date constructor which can be unreliable)
-      const monthNames = ['january', 'february', 'march', 'april', 'may', 'june', 
+      const monthNames = ['january', 'february', 'march', 'april', 'may', 'june',
                          'july', 'august', 'september', 'october', 'november', 'december'];
-      const monthAbbr = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 
+      const monthAbbr = ['jan', 'feb', 'mar', 'apr', 'may', 'jun',
                         'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
-      
+
       let found = false;
       for (let i = 0; i < monthNames.length && !found; i++) {
         const monthPattern = `(?:${monthNames[i]}|${monthAbbr[i]})`;
@@ -116,7 +125,7 @@ function parseAndFormatDate(dateString, fieldType) {
           break;
         }
       }
-      
+
       // If month name parsing didn't work, try other formats
       if (!found) {
         // Try "DD/MM/YYYY" or "MM/DD/YYYY" - assume MM/DD/YYYY for US format
@@ -127,7 +136,7 @@ function parseAndFormatDate(dateString, fieldType) {
           found = true;
         }
       }
-      
+
       if (!found) {
         // Try "DD-MM-YYYY" or "MM-DD-YYYY"
         const dashMatch = trimmed.match(/(\d{1,2})-(\d{1,2})-(\d{4})/);
@@ -137,7 +146,7 @@ function parseAndFormatDate(dateString, fieldType) {
           found = true;
         }
       }
-      
+
       // Last resort: try direct Date parsing
       if (!found) {
         date = new Date(trimmed);
@@ -153,18 +162,18 @@ function parseAndFormatDate(dateString, fieldType) {
         }
       }
     }
-    
+
     // Check if we have a valid date
     if (!date || isNaN(date.getTime())) {
       console.warn(`Could not parse date: "${dateString}"`);
       return null;
     }
-    
+
     // Format to YYYY-MM-DDTHH:mm:ss
     const year = date.getFullYear();
     const month = String(date.getMonth() + 1).padStart(2, '0');
     const day = String(date.getDate()).padStart(2, '0');
-    
+
     // For DATE_AND_TIME, include time; for DATE, use 00:00:00
     if (fieldType === "DATE_AND_TIME") {
       // If time was provided in the string, try to extract it
@@ -210,7 +219,7 @@ app.post("/agent/start", (req, res) => {
 
   const sessionId = uuid();
   const initialConversation = [];
-  
+
   sessions.set(sessionId, {
     sessionId,
     formDefinition,
@@ -223,28 +232,29 @@ app.post("/agent/start", (req, res) => {
   // Find the first required field to ask about
   const firstRequiredField = formDefinition.find(f => f.isRequired);
   const totalRequiredFields = formDefinition.filter(f => f.isRequired).length;
-  
+
   let initialMessage = "Hi there! 👋 I'm here to help you fill out this form. ";
   let options = null;
   let optionType = null;
-  
+
+
   // Set lastAskedFieldId if we're asking about a field
   if (firstRequiredField) {
     const session = sessions.get(sessionId);
     if (session) {
       session.lastAskedFieldId = firstRequiredField.id;
     }
-    
+
     // Use buildAskResponse to get the proper question and options
     const askResponse = buildAskResponse(firstRequiredField, null);
     const fieldName = firstRequiredField.fieldName.toLowerCase();
-    
+
     if (totalRequiredFields === 1) {
       initialMessage += `I just need one piece of information from you. ${askResponse.chat}`;
     } else {
       initialMessage += `I'll guide you through ${totalRequiredFields} required fields. Let's start - ${askResponse.chat}`;
     }
-    
+
     // Include options if the field has them (dropdown, checkbox, checklist)
     if (askResponse.ui?.options && askResponse.ui.options.length > 0) {
       options = askResponse.ui.options;
@@ -285,7 +295,7 @@ app.post("/agent/message", async (req, res) => {
     return res.json(agentDecision);
   } catch (error) {
     console.error("Error in /agent/message:", error);
-    return res.status(500).json({ 
+    return res.status(500).json({
       error: "Internal server error",
       type: "CHAT",
       ui: { text: "Sorry, something went wrong. Please try again." }
@@ -314,7 +324,7 @@ app.post("/agent/step", async (req, res) => {
     return res.json(agentDecision);
   } catch (error) {
     console.error("Error in /agent/step:", error);
-    return res.status(500).json({ 
+    return res.status(500).json({
       error: "Internal server error",
       type: "CHAT",
       ui: { text: "Sorry, something went wrong. Please try again." }
@@ -325,42 +335,228 @@ app.post("/agent/step", async (req, res) => {
 // Audio message endpoint - accepts audio file and transcribes it
 app.post("/agent/audio", upload.single('audio'), async (req, res) => {
   try {
-    const { sessionId } = req.body;
+    const sessionId = req.body?.sessionId;
     const audioFile = req.file;
 
+    console.log("Audio request received:", {
+      hasAudioFile: !!audioFile,
+      sessionId: sessionId,
+      bodyKeys: Object.keys(req.body || {}),
+      allSessions: Array.from(sessions.keys())
+    });
+
     if (!audioFile) {
-      return res.status(400).json({ error: "No audio file provided" });
+      console.error("No audio file received in request");
+      return res.status(400).json({
+        error: "No audio file provided",
+        type: "CHAT",
+        ui: { text: "No audio file received. Please try recording again." }
+      });
+    }
+
+    if (!sessionId) {
+      console.error("No sessionId provided in request");
+      return res.status(400).json({
+        error: "No session ID provided",
+        type: "CHAT",
+        ui: { text: "Session ID missing. Please refresh the page and try again." }
+      });
     }
 
     const session = sessions.get(sessionId);
     if (!session) {
-      return res.status(404).json({ error: "Invalid session" });
+      console.error(`Invalid session ID: ${sessionId}`);
+      console.error(`Available sessions: ${Array.from(sessions.keys()).join(', ')}`);
+      return res.status(404).json({
+        error: "Invalid session",
+        type: "CHAT",
+        ui: { text: "Session expired. Please refresh the page." }
+      });
     }
 
-    console.log(`Received audio file: ${audioFile.mimetype}, size: ${audioFile.size} bytes`);
+    console.log(`Received audio file: ${audioFile.mimetype}, size: ${audioFile.size} bytes, originalname: ${audioFile.originalname}`);
+
+    // Validate audio file size (max 10MB)
+    if (audioFile.size > 10 * 1024 * 1024) {
+      return res.status(400).json({
+        error: "Audio file too large",
+        type: "CHAT",
+        ui: { text: "Audio file is too large. Please record a shorter message." }
+      });
+    }
+
+    // Normalize MIME type - Gemini supports various audio formats
+    let mimeType = audioFile.mimetype;
+    // Map common audio MIME types to Gemini-supported formats
+    const mimeTypeMap = {
+      'audio/webm': 'audio/webm',
+      'audio/mp4': 'audio/mp4',
+      'audio/mpeg': 'audio/mpeg',
+      'audio/wav': 'audio/wav',
+      'audio/x-m4a': 'audio/mp4',
+      'audio/ogg': 'audio/ogg'
+    };
+
+    // Use mapped MIME type or default to webm
+    if (!mimeTypeMap[mimeType]) {
+      console.warn(`Unrecognized MIME type: ${mimeType}, defaulting to audio/webm`);
+      mimeType = 'audio/webm';
+    } else {
+      mimeType = mimeTypeMap[mimeType];
+    }
+
+    // Check if API key is set
+    if (!process.env.GEMINI_API_KEY) {
+      console.error("GEMINI_API_KEY is not set");
+      return res.status(500).json({
+        error: "Server configuration error",
+        type: "CHAT",
+        ui: { text: "Server configuration error. Please contact support." }
+      });
+    }
 
     // Initialize Gemini for audio transcription
+    // Use the same model that works for text generation
     const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+
+    // Use the same model as text generation (gemini-2.5-flash-lite)
+    // If this doesn't support audio, we'll catch the error and try alternatives
+    const model = genAI.getGenerativeModel({
+      model: "gemini-2.5-flash-lite"
+    });
 
     // Convert audio buffer to base64
     const audioBase64 = audioFile.buffer.toString('base64');
+    console.log(`Audio converted to base64, length: ${audioBase64.length}, MIME type: ${mimeType}`);
 
-    // Transcribe audio using Gemini
-    const transcriptionResult = await model.generateContent([
-      {
-        inlineData: {
-          mimeType: audioFile.mimetype,
-          data: audioBase64
+    // Transcribe audio using Gemini with retry logic for quota errors
+   // REVISED LIST: Prioritize stable models that support audio
+   const modelsToTry = [
+    "gemini-1.5-flash",      // BEST for audio & speed (Stable)
+    "gemini-1.5-pro",        // Good alternative (Stable)
+    "gemini-2.0-flash-exp",  // Experimental (Often hits quota limits)
+    "gemini-2.0-flash"       // Experimental
+  ];
+
+    let transcriptionResult = null;
+    let lastError = null;
+    const maxRetries = 1; // Reduced retries for quota errors - they won't resolve quickly
+    const baseDelay = 1000; // 1 second
+
+    for (const modelName of modelsToTry) {
+      let retries = 0;
+      let success = false;
+
+      while (retries <= maxRetries && !success) {
+        try {
+          console.log(`Trying to transcribe with model: ${modelName} (attempt ${retries + 1}/${maxRetries + 1})`);
+          const currentModel = genAI.getGenerativeModel({ model: modelName });
+          transcriptionResult = await currentModel.generateContent([
+            {
+              inlineData: {
+                mimeType: mimeType,
+                data: audioBase64
+              }
+            },
+            { text: "Transcribe this audio exactly. The audio may be in Punjabi, Hindi, or English. Transcribe it in the same language it was spoken. Return ONLY the transcribed text in the original language, nothing else. If the audio is unclear or empty, return an empty string." }
+          ]);
+          console.log(`Successfully transcribed with model: ${modelName}`);
+          success = true;
+          break; // Success, exit retry loop
+        } catch (error) {
+          const errorStatus = error?.status || error?.response?.status || error?.statusCode;
+          const errorMessage = String(error?.message || error?.toString() || '');
+          const isQuotaError = errorStatus === 429 ||
+                             Number(errorStatus) === 429 ||
+                             errorMessage.includes('429') ||
+                             errorMessage.includes('quota') ||
+                             errorMessage.includes('Too Many Requests') ||
+                             errorMessage.includes('exceeded your current quota');
+
+          // Handle quota errors - fail fast, don't retry (quota won't reset quickly)
+          if (isQuotaError) {
+            // Extract retry delay for user message, but don't wait
+            let retryDelaySeconds = 40; // Default
+
+            if (error.errorDetails && Array.isArray(error.errorDetails)) {
+              const retryInfo = error.errorDetails.find(detail => detail['@type'] === 'type.googleapis.com/google.rpc.RetryInfo');
+              if (retryInfo && retryInfo.retryDelay) {
+                const delayMatch = String(retryInfo.retryDelay).match(/(\d+(?:\.\d+)?)s?/);
+                if (delayMatch) {
+                  retryDelaySeconds = Math.ceil(parseFloat(delayMatch[1]));
+                }
+              }
+            } else {
+              const messageMatch = errorMessage.match(/retry in ([\d.]+)s/i);
+              if (messageMatch) {
+                retryDelaySeconds = Math.ceil(parseFloat(messageMatch[1]));
+              }
+            }
+
+            console.log(`Quota error for ${modelName} - failing fast with retry delay info: ${retryDelaySeconds}s`);
+            // Store error with retry delay info and preserve status
+            error.retryDelaySeconds = retryDelaySeconds;
+            error.status = error.status || 429; // Ensure status is set
+            lastError = error;
+            break; // Exit retry loop, try next model or fail
+          }
+
+          // If it's a 404 (model not found), try next model
+          if (errorStatus === 404) {
+            console.warn(`Model ${modelName} not found (404), trying next model`);
+            lastError = error;
+            break; // Exit retry loop, try next model
+          }
+
+          // Quota errors are already handled above, so this shouldn't be reached
+          // But keep it as a safety check
+
+          // For other errors, throw immediately
+          throw error;
         }
-      },
-      { text: "Transcribe this audio exactly. Return ONLY the transcribed text, nothing else. If the audio is unclear or empty, return an empty string." }
-    ]);
+      }
+
+      if (success) {
+        break; // Success, exit model loop
+      }
+    }
+
+    if (!transcriptionResult) {
+      // If lastError is a quota error, preserve and throw it so it gets handled correctly
+      if (lastError) {
+        const errorStatus = lastError?.status || lastError?.response?.status || lastError?.statusCode;
+        const errorMessage = String(lastError?.message || lastError?.toString() || '');
+        const isQuotaError = errorStatus === 429 ||
+                           Number(errorStatus) === 429 ||
+                           errorMessage.includes('429') ||
+                           errorMessage.includes('quota') ||
+                           errorMessage.includes('Too Many Requests') ||
+                           errorMessage.includes('exceeded your current quota');
+
+        if (isQuotaError || lastError.retryDelaySeconds) {
+          // Create a proper error object that will be caught as quota error
+          const quotaError = new Error(lastError.message || 'API quota exceeded');
+          quotaError.status = 429;
+          quotaError.errorDetails = lastError.errorDetails;
+          quotaError.retryDelaySeconds = lastError.retryDelaySeconds || 40;
+          quotaError.name = lastError.name || 'QuotaError';
+          throw quotaError;
+        }
+      }
+      throw new Error(`All models failed. Last error: ${lastError?.message || 'Unknown error'}`);
+    }
+
+    console.log("Gemini transcription response received");
+
+    // Check if response is valid
+    if (!transcriptionResult || !transcriptionResult.response) {
+      throw new Error("Invalid response from Gemini API");
+    }
 
     const transcribedText = transcriptionResult.response.text().trim();
     console.log(`Transcribed text: "${transcribedText}"`);
 
-    if (!transcribedText) {
+    if (!transcribedText || transcribedText.length === 0) {
       return res.json({
         type: "CHAT",
         ui: {
@@ -382,8 +578,89 @@ app.post("/agent/audio", upload.single('audio'), async (req, res) => {
       transcribedText
     });
   } catch (error) {
+    console.error("Gemini API error:", error);
+    console.error("Error details:", {
+      message: error.message,
+      stack: error.stack,
+      name: error.name,
+      status: error.status
+    });
+
+    const errorStatus = error?.status || error?.response?.status || error?.statusCode;
+    const errorMessage = String(error?.message || error?.toString() || '');
+    const isQuotaError = errorStatus === 429 ||
+                       Number(errorStatus) === 429 ||
+                       errorMessage.includes('429') ||
+                       errorMessage.includes('quota') ||
+                       errorMessage.includes('Too Many Requests') ||
+                       errorMessage.includes('exceeded your current quota');
+
+    // Handle quota errors - use stored retry delay if available (fail fast)
+    if (isQuotaError) {
+      let retryDelay = error.retryDelaySeconds || 40; // Use stored delay or default
+
+      // If not stored, try to extract from error
+      if (!error.retryDelaySeconds) {
+        if (error.errorDetails && Array.isArray(error.errorDetails)) {
+          const retryInfo = error.errorDetails.find(detail => detail['@type'] === 'type.googleapis.com/google.rpc.RetryInfo');
+          if (retryInfo && retryInfo.retryDelay) {
+            const delayMatch = String(retryInfo.retryDelay).match(/(\d+(?:\.\d+)?)s?/);
+            if (delayMatch) {
+              retryDelay = Math.ceil(parseFloat(delayMatch[1]));
+            }
+          }
+        }
+
+        // Also try to extract from error message
+        if (retryDelay === 40) {
+          const messageMatch = errorMessage.match(/retry in ([\d.]+)s/i);
+          if (messageMatch) {
+            retryDelay = Math.ceil(parseFloat(messageMatch[1]));
+          }
+        }
+      }
+
+      console.error(`Quota exceeded - failing fast. Retry delay: ${retryDelay}s`);
+      return res.status(429).json({
+        error: "API quota exceeded",
+        type: "CHAT",
+        ui: {
+          text: `The API quota has been exceeded. Please wait about ${retryDelay} seconds and try again, or type your message instead.`
+        }
+      });
+    }
+
+    // Handle model not found errors
+    if (errorStatus === 404 || errorMessage.includes('not found') || errorMessage.includes('is not found')) {
+      console.error("Model not found error:", error);
+      return res.status(400).json({
+        error: "Audio transcription not supported",
+        type: "CHAT",
+        ui: { text: "Audio transcription is not available with the current API configuration. Please type your message instead." }
+      });
+    }
+
+    // Check if it's an API key issue
+    if (errorMessage.includes('API_KEY')) {
+      return res.status(500).json({
+        error: "API configuration error",
+        type: "CHAT",
+        ui: { text: "Server configuration error. Please contact support." }
+      });
+    }
+
+    // Check if it's an unsupported format issue
+    if (errorMessage.includes('format') || errorMessage.includes('mime')) {
+      return res.status(400).json({
+        error: "Unsupported audio format",
+        type: "CHAT",
+        ui: { text: "Audio format not supported. Please try recording again." }
+      });
+    }
+
+    // Generic error handling for any other errors
     console.error("Error in /agent/audio:", error);
-    return res.status(500).json({ 
+    return res.status(500).json({
       error: "Failed to process audio",
       type: "CHAT",
       ui: { text: "Sorry, I couldn't process the audio. Please try again or type your message." }
@@ -394,10 +671,10 @@ app.post("/agent/audio", upload.single('audio'), async (req, res) => {
 async function runAgent(session) {
   try {
     // Get the last user message
-    const lastUserMessage = session.conversation.length > 0 
+    const lastUserMessage = session.conversation.length > 0
       ? session.conversation[session.conversation.length - 1].text.trim()
       : "";
-    
+
     // If lastAskedFieldId is not set but we have unfilled required fields, use the first one
     if (!session.lastAskedFieldId && lastUserMessage) {
       const requiredFields = session.formDefinition.filter(f => f.isRequired);
@@ -407,7 +684,7 @@ async function runAgent(session) {
         console.log(`Auto-setting lastAskedFieldId to first unfilled required field: ${unfilledRequiredFields[0].fieldName}`);
       }
     }
-    
+
     // AGGRESSIVE FALLBACK: If we asked about a field and user provided a substantial response, force SET_FIELD
     if (session.lastAskedFieldId && lastUserMessage) {
       const lastAskedField = session.formDefinition.find(f => f.id === session.lastAskedFieldId);
@@ -415,31 +692,53 @@ async function runAgent(session) {
         // Check if message is a simple greeting/question word (exact match only, case insensitive)
         const trimmedMessage = lastUserMessage.trim();
         const isGreetingOrQuestion = /^(hi|hello|hey|good morning|good afternoon|good evening|how are you|what|when|where|how|why|can you|could you|would you|will you|please|thanks|thank you|yes|no|ok|okay|sure|alright|fine|good|great)$/i.test(trimmedMessage);
-        
+
         // For text fields (SINGLE_LINE_TEXT, MULTI_LINE_TEXT), be VERY lenient - any non-greeting is a value
-        const isTextField = lastAskedField.fieldType === "SINGLE_LINE_TEXT" || 
+        const isTextField = lastAskedField.fieldType === "SINGLE_LINE_TEXT" ||
                            lastAskedField.fieldType === "MULTI_LINE_TEXT";
-        
+
+        // For dropdown fields, check if the value matches one of the options
+        const isDropdown = lastAskedField.fieldType === "DROPDOWN";
+        let matchesDropdownOption = false;
+        if (isDropdown && lastAskedField.dropDownOptions) {
+          matchesDropdownOption = lastAskedField.dropDownOptions.some(
+            opt => opt.toLowerCase() === trimmedMessage.toLowerCase()
+          );
+        }
+
         // Check if message looks like a value
         // For text fields: ANY non-greeting response is a value (even single words like "VAIBHAV", "RAMAN")
+        // For dropdown fields: if it matches an option, it's definitely a value
         // For other fields: need more substantial content
         const hasContent = trimmedMessage.length >= 2;
-        const isLikelyValue = isTextField 
+        const isLikelyValue = isTextField
           ? (hasContent && !isGreetingOrQuestion)  // Text fields: any non-greeting with 2+ chars
+          : isDropdown
+          ? (hasContent && !isGreetingOrQuestion && matchesDropdownOption)  // Dropdown: must match an option
           : (hasContent && !isGreetingOrQuestion && (trimmedMessage.split(/\s+/).length > 1 || trimmedMessage.length > 5)); // Other fields: need more
-        
-        console.log(`Fallback check: field=${lastAskedField.fieldName}, message="${trimmedMessage}", isGreeting=${isGreetingOrQuestion}, isTextField=${isTextField}, isLikelyValue=${isLikelyValue}`);
-        
+
+        console.log(`Fallback check: field=${lastAskedField.fieldName}, message="${trimmedMessage}", isGreeting=${isGreetingOrQuestion}, isTextField=${isTextField}, isDropdown=${isDropdown}, matchesDropdownOption=${matchesDropdownOption}, isLikelyValue=${isLikelyValue}`);
+
         if (isLikelyValue) {
           console.log(`AGGRESSIVE FALLBACK: Forcing SET_FIELD for ${lastAskedField.fieldName} with value: "${lastUserMessage}"`);
           // Skip AI call and directly set the field
           let fieldValue = lastUserMessage;
-          
+
+          // For dropdown fields, use the exact option from the list (case-sensitive match)
+          if (isDropdown && lastAskedField.dropDownOptions) {
+            const matchingOption = lastAskedField.dropDownOptions.find(
+              opt => opt.toLowerCase() === trimmedMessage.toLowerCase()
+            );
+            if (matchingOption) {
+              fieldValue = matchingOption; // Use exact option from list
+            }
+          }
+
           // Extract clean value (remove helping verbs/phrases) for text fields
-          if (lastAskedField.fieldType === "SINGLE_LINE_TEXT" || lastAskedField.fieldType === "MULTI_LINE_TEXT") {
+          if (isTextField) {
             fieldValue = extractCleanValue(fieldValue, lastAskedField.fieldName);
           }
-          
+
           // Parse and format date fields in fallback too
           if (lastAskedField.fieldType === "DATE" || lastAskedField.fieldType === "DATE_AND_TIME") {
             const formattedDate = parseAndFormatDate(fieldValue, lastAskedField.fieldType);
@@ -448,20 +747,49 @@ async function runAgent(session) {
               console.log(`Fallback: Formatted date from "${lastUserMessage}" to "${fieldValue}"`);
             }
           }
-          
+
           const fieldIdToUpdate = session.lastAskedFieldId; // Save before clearing
           session.formState[fieldIdToUpdate] = fieldValue;
           session.lastAskedFieldId = null; // Clear after saving
-          
-          // Convert formState to array format for frontend
+
+          // Convert formState to array format for frontend with proper field type handling
           const finalUpdatedForm = session.formDefinition.map(field => {
             const storedValue = session.formState[field.id];
-            
+
             if (field.id === lastAskedField.id) {
-              return {
-                ...field,
-                fieldValue: fieldValue || null
-              };
+              // This is the field we just updated - handle by field type
+              switch (field.fieldType) {
+                case "DROPDOWN":
+                  return {
+                    ...field,
+                    selectedDropdownOption: fieldValue || null,
+                    fieldValue: null
+                  };
+                case "CHECKBOX":
+                  return {
+                    ...field,
+                    selectedCheckboxOptions: Array.isArray(fieldValue) ? fieldValue : [fieldValue].filter(Boolean),
+                    fieldValue: null
+                  };
+                case "CHECKLIST":
+                  return {
+                    ...field,
+                    selectedChecklistOptions: Array.isArray(fieldValue) ? fieldValue : [fieldValue].filter(Boolean),
+                    fieldValue: null
+                  };
+                case "DATE":
+                case "DATE_AND_TIME":
+                  return {
+                    ...field,
+                    dateAndTimeValue: fieldValue || null,
+                    fieldValue: null
+                  };
+                default:
+                  return {
+                    ...field,
+                    fieldValue: fieldValue || null
+                  };
+              }
             } else {
               return {
                 ...field,
@@ -473,11 +801,11 @@ async function runAgent(session) {
               };
             }
           });
-          
+
           // Check if there are more required fields
           const requiredFields = session.formDefinition.filter(f => f.isRequired);
           const unfilledRequiredFields = requiredFields.filter(f => !session.formState[f.id]);
-          
+
           if (unfilledRequiredFields.length > 0) {
             const nextField = unfilledRequiredFields[0];
             const nextFieldQuestion = buildAskResponse(nextField, null);
@@ -514,18 +842,41 @@ async function runAgent(session) {
     if ((decision.action === "MESSAGE" || decision.action === "ASK_FIELD") && session.lastAskedFieldId && lastUserMessage) {
       const lastAskedField = session.formDefinition.find(f => f.id === session.lastAskedFieldId);
       if (lastAskedField && !session.formState[session.lastAskedFieldId]) {
-        const isGreetingOrQuestion = /^(hi|hello|hey|good morning|good afternoon|good evening|how are you|what|when|where|how|why|can you|could you|would you|will you|please|thanks|thank you|yes|no|ok|okay|sure|alright)$/i.test(lastUserMessage);
-        const hasContent = lastUserMessage.length > 3 && !isGreetingOrQuestion;
-        
-        if (hasContent) {
+        const trimmedMessage = lastUserMessage.trim();
+        const isGreetingOrQuestion = /^(hi|hello|hey|good morning|good afternoon|good evening|how are you|what|when|where|how|why|can you|could you|would you|will you|please|thanks|thank you|yes|no|ok|okay|sure|alright)$/i.test(trimmedMessage);
+        const hasContent = trimmedMessage.length > 3 && !isGreetingOrQuestion;
+
+        // For dropdown fields, check if the value matches one of the options
+        const isDropdown = lastAskedField.fieldType === "DROPDOWN";
+        let matchesDropdownOption = false;
+        if (isDropdown && lastAskedField.dropDownOptions) {
+          matchesDropdownOption = lastAskedField.dropDownOptions.some(
+            opt => opt.toLowerCase() === trimmedMessage.toLowerCase()
+          );
+        }
+
+        // For dropdowns, only proceed if it matches an option
+        const shouldProceed = isDropdown ? (hasContent && matchesDropdownOption) : hasContent;
+
+        if (shouldProceed) {
           console.log(`SECONDARY FALLBACK: Forcing SET_FIELD for ${lastAskedField.fieldName} with value: "${lastUserMessage}"`);
           let fieldValue = lastUserMessage;
-          
+
+          // For dropdown fields, use the exact option from the list (case-sensitive match)
+          if (isDropdown && lastAskedField.dropDownOptions) {
+            const matchingOption = lastAskedField.dropDownOptions.find(
+              opt => opt.toLowerCase() === trimmedMessage.toLowerCase()
+            );
+            if (matchingOption) {
+              fieldValue = matchingOption; // Use exact option from list
+            }
+          }
+
           // Extract clean value (remove helping verbs/phrases) for text fields
           if (lastAskedField.fieldType === "SINGLE_LINE_TEXT" || lastAskedField.fieldType === "MULTI_LINE_TEXT") {
             fieldValue = extractCleanValue(fieldValue, lastAskedField.fieldName);
           }
-          
+
           // Parse and format date fields in secondary fallback too
           if (lastAskedField.fieldType === "DATE" || lastAskedField.fieldType === "DATE_AND_TIME") {
             const formattedDate = parseAndFormatDate(fieldValue, lastAskedField.fieldType);
@@ -534,7 +885,7 @@ async function runAgent(session) {
               console.log(`Secondary fallback: Formatted date from "${lastUserMessage}" to "${fieldValue}"`);
             }
           }
-          
+
           decision.action = "SET_FIELD";
           decision.payload = {
             fieldId: session.lastAskedFieldId,
@@ -551,7 +902,7 @@ async function runAgent(session) {
         const fieldToUpdate = session.formDefinition.find(
           f => f.id === decision.payload.fieldId
         );
-        
+
         if (!fieldToUpdate) {
           console.error("Field not found:", decision.payload.fieldId);
           return {
@@ -564,12 +915,12 @@ async function runAgent(session) {
 
         // Store the value in formState
         let fieldValue = decision.payload.value;
-        
+
         // Extract clean value (remove helping verbs/phrases) for text fields
         if (fieldToUpdate.fieldType === "SINGLE_LINE_TEXT" || fieldToUpdate.fieldType === "MULTI_LINE_TEXT") {
           fieldValue = extractCleanValue(fieldValue, fieldToUpdate.fieldName);
         }
-        
+
         // Parse and format date fields
         if (fieldToUpdate.fieldType === "DATE" || fieldToUpdate.fieldType === "DATE_AND_TIME") {
           const formattedDate = parseAndFormatDate(fieldValue, fieldToUpdate.fieldType);
@@ -581,7 +932,7 @@ async function runAgent(session) {
             // Still store the original value, but it might not be in correct format
           }
         }
-        
+
         // Validate dropdown values
         if (fieldToUpdate.fieldType === "DROPDOWN" && fieldToUpdate.dropDownOptions) {
           // Check if value matches one of the options (case-insensitive)
@@ -595,7 +946,7 @@ async function runAgent(session) {
             // Still store it, but log a warning
           }
         }
-        
+
         session.formState[decision.payload.fieldId] = fieldValue;
         // Clear the last asked field since we've filled it
         session.lastAskedFieldId = null;
@@ -604,7 +955,7 @@ async function runAgent(session) {
         // Convert formState to array format for frontend with proper field type handling
         const updatedForm = session.formDefinition.map(field => {
           const storedValue = session.formState[field.id];
-          
+
           if (field.id === decision.payload.fieldId) {
             // This is the field we just updated
             switch (field.fieldType) {
@@ -653,14 +1004,14 @@ async function runAgent(session) {
         });
 
         const fieldName = decision.payload.fieldLabel || fieldToUpdate.fieldName || "field";
-        
+
         // Check if all required fields are now filled
         const requiredFields = session.formDefinition.filter(f => f.isRequired);
         const allRequiredFilled = requiredFields.every(f => session.formState[f.id]);
-        
+
         // Check if there are more required fields to fill
         const unfilledRequiredFields = requiredFields.filter(f => !session.formState[f.id]);
-        
+
         // If all required fields are filled and we haven't asked about optional fields yet
         if (allRequiredFilled && session.status !== "required-complete" && session.status !== "optional-phase") {
           session.status = "required-complete";
@@ -672,7 +1023,7 @@ async function runAgent(session) {
             }
           };
         }
-        
+
         // If there are more required fields, automatically ask about the next one
         if (unfilledRequiredFields.length > 0) {
           const nextField = unfilledRequiredFields[0];
@@ -687,7 +1038,7 @@ async function runAgent(session) {
             }
           };
         }
-        
+
         // If all required fields are filled, return the update
         return {
           type: "FORM_UPDATE",
@@ -734,35 +1085,35 @@ async function runAgent(session) {
 
       case "MESSAGE":
         // Check if user wants to continue with optional fields
-        const lastMessage = session.conversation.length > 0 
+        const lastMessage = session.conversation.length > 0
           ? session.conversation[session.conversation.length - 1].text.toLowerCase().trim()
           : "";
-        
+
         const wantsToContinue = lastMessage && (
-          lastMessage.includes("yes") || 
-          lastMessage.includes("continue") || 
+          lastMessage.includes("yes") ||
+          lastMessage.includes("continue") ||
           lastMessage.includes("sure") ||
           lastMessage.includes("ok") ||
           lastMessage.includes("let's") ||
           lastMessage.includes("go ahead") ||
           lastMessage.includes("optional")
         );
-        
+
         const wantsToSubmit = lastMessage && (
-          lastMessage.includes("no") || 
-          lastMessage.includes("submit") || 
+          lastMessage.includes("no") ||
+          lastMessage.includes("submit") ||
           lastMessage.includes("done") ||
           lastMessage.includes("finish") ||
           lastMessage.includes("that's all") ||
           lastMessage.includes("ready to submit")
         );
-        
+
         // If user wants to continue with optional fields, transition to optional phase
         if (wantsToContinue && session.status === "required-complete") {
           session.status = "optional-phase";
           // The AI should handle asking about the first optional field in its next response
         }
-        
+
         // If user wants to submit, confirm the form
         if (wantsToSubmit && (session.status === "required-complete" || session.status === "optional-phase")) {
           session.status = "completed";
@@ -785,7 +1136,7 @@ async function runAgent(session) {
             }
           };
         }
-        
+
         return {
           type: "CHAT",
           ui: {
@@ -839,23 +1190,23 @@ function buildPrompt(session) {
   const requiredFields = session.formDefinition.filter(f => f.isRequired);
   const unfilledRequiredFields = requiredFields.filter(f => !session.formState[f.id]);
   const allRequiredFieldsFilled = requiredFields.length > 0 && requiredFields.every(f => session.formState[f.id]);
-  
+
   // Find optional fields that haven't been filled
   const optionalFields = session.formDefinition.filter(f => !f.isRequired);
   const unfilledOptionalFields = optionalFields.filter(f => !session.formState[f.id]);
-  
+
   // Check if we're in the "continue or submit" phase
   const isAskingAboutOptionalFields = session.status === "required-complete";
 
   // Get the last user message
-  const lastUserMessage = session.conversation.length > 0 
+  const lastUserMessage = session.conversation.length > 0
     ? session.conversation[session.conversation.length - 1].text.toLowerCase().trim()
     : "";
 
   // Check if it's a greeting
   const isGreeting = lastUserMessage && (
-    lastUserMessage.includes("hi") || 
-    lastUserMessage.includes("hello") || 
+    lastUserMessage.includes("hi") ||
+    lastUserMessage.includes("hello") ||
     lastUserMessage.includes("hey") ||
     lastUserMessage.includes("good morning") ||
     lastUserMessage.includes("good afternoon") ||
@@ -864,24 +1215,24 @@ function buildPrompt(session) {
 
   // Check if user wants to continue or submit
   const wantsToContinue = lastUserMessage && (
-    lastUserMessage.includes("yes") || 
-    lastUserMessage.includes("continue") || 
+    lastUserMessage.includes("yes") ||
+    lastUserMessage.includes("continue") ||
     lastUserMessage.includes("sure") ||
     lastUserMessage.includes("ok") ||
     lastUserMessage.includes("let's") ||
     lastUserMessage.includes("go ahead")
   );
-  
+
   const wantsToSubmit = lastUserMessage && (
-    lastUserMessage.includes("no") || 
-    lastUserMessage.includes("submit") || 
+    lastUserMessage.includes("no") ||
+    lastUserMessage.includes("submit") ||
     lastUserMessage.includes("done") ||
     lastUserMessage.includes("finish") ||
     lastUserMessage.includes("that's all")
   );
 
   // Get the last user message for context
-  const lastUserMsg = session.conversation.length > 0 
+  const lastUserMsg = session.conversation.length > 0
     ? session.conversation[session.conversation.length - 1].text.trim()
     : "";
 
@@ -959,7 +1310,7 @@ PHASE 3 - Optional Fields (if user says yes):
 - Be less pushy - "Would you like to add [field name]?" or "Is there anything else you'd like to include?"
 
 ACTION RULES (IN ORDER OF PRIORITY):
-1. FIRST PRIORITY - SET_FIELD: 
+1. FIRST PRIORITY - SET_FIELD:
    - If LAST ASKED FIELD exists and LAST USER MESSAGE is not a greeting/question, you MUST use SET_FIELD
    - If user provides ANY value that matches a field (especially the field you just asked about), use SET_FIELD IMMEDIATELY
    - This is the MOST IMPORTANT rule - extract values as soon as provided
@@ -1076,9 +1427,9 @@ async function callGemini(prompt) {
       responseMimeType: "application/json"
     }
   });
-  
+
   const responseText = result.response.text();
   console.log(util.inspect({responseText}, { depth: null, colors: true }));
-  
+
   return JSON.parse(responseText);
 }

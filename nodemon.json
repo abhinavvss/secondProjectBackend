@@ -1,0 +1,19 @@
+{
+  "watch": [
+    "server.js",
+    "routes.js",
+    "gemini.js",
+    "validator.js",
+    "promptBuilder.js"
+  ],
+  "ext": "js,json",
+  "ignore": [
+    "node_modules/**",
+    "*.log"
+  ],
+  "delay": 500,
+  "env": {
+    "NODE_ENV": "development"
+  }
+}
+

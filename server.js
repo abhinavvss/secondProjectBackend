@@ -429,96 +429,72 @@ app.post("/agent/audio", upload.single('audio'), async (req, res) => {
     const audioBase64 = audioFile.buffer.toString('base64');
     console.log(`Audio converted to base64, length: ${audioBase64.length}, MIME type: ${mimeType}`);
 
-    // Transcribe audio using Gemini with retry logic for quota errors
-    // Use the same model as text generation first (it's working for text)
-    // Then try other models that support free tier
+    // Transcribe audio: try 1–2 models with a per-call timeout so we don't wait too long
+    const AUDIO_TIMEOUT_MS = 20000; // 20 seconds per model
     const modelsToTry = [
-      "gemini-2.5-flash-lite",  // Same as text generation - should work
-      "gemini-1.5-flash-8b",    // Free tier supported variant
-      "gemini-1.5-flash",       // Standard flash
-      "gemini-1.5-pro"         // Pro model
+      "gemini-2.5-flash",       // Primary: supports audio
+      "gemini-2.5-flash-lite",  // Fallback
+      "gemini-1.5-flash"        // Last resort
     ];
 
     let transcriptionResult = null;
     let lastError = null;
-    const maxRetries = 1; // Reduced retries for quota errors - they won't resolve quickly
-    const baseDelay = 1000; // 1 second
 
     for (const modelName of modelsToTry) {
-      let retries = 0;
-      let success = false;
-
-      while (retries <= maxRetries && !success) {
-        try {
-          console.log(`Trying to transcribe with model: ${modelName} (attempt ${retries + 1}/${maxRetries + 1})`);
-          const currentModel = genAI.getGenerativeModel({ model: modelName });
-          transcriptionResult = await currentModel.generateContent([
-            {
-              inlineData: {
-                mimeType: mimeType,
-                data: audioBase64
-              }
-            },
-            { text: "Transcribe this audio and translate it to English. The audio may be in Punjabi, Hindi, or English. If the audio is in Punjabi or Hindi, translate it to English. If it's already in English, keep it in English. Return ONLY the English transcribed/translated text, nothing else. If the audio is unclear or empty, return an empty string." }
-          ]);
-          console.log(`Successfully transcribed with model: ${modelName}`);
-          success = true;
-          break; // Success, exit retry loop
-        } catch (error) {
-          const errorStatus = error?.status || error?.response?.status || error?.statusCode;
-          const errorMessage = String(error?.message || error?.toString() || '');
-          const isQuotaError = errorStatus === 429 ||
-                             Number(errorStatus) === 429 ||
-                             errorMessage.includes('429') ||
-                             errorMessage.includes('quota') ||
-                             errorMessage.includes('Too Many Requests') ||
-                             errorMessage.includes('exceeded your current quota');
-
-          // Handle quota errors - fail fast, don't retry (quota won't reset quickly)
-          if (isQuotaError) {
-            // Extract retry delay for user message, but don't wait
-            let retryDelaySeconds = 40; // Default
-
-            if (error.errorDetails && Array.isArray(error.errorDetails)) {
-              const retryInfo = error.errorDetails.find(detail => detail['@type'] === 'type.googleapis.com/google.rpc.RetryInfo');
-              if (retryInfo && retryInfo.retryDelay) {
-                const delayMatch = String(retryInfo.retryDelay).match(/(\d+(?:\.\d+)?)s?/);
-                if (delayMatch) {
-                  retryDelaySeconds = Math.ceil(parseFloat(delayMatch[1]));
-                }
-              }
-            } else {
-              const messageMatch = errorMessage.match(/retry in ([\d.]+)s/i);
-              if (messageMatch) {
-                retryDelaySeconds = Math.ceil(parseFloat(messageMatch[1]));
-              }
+      try {
+        console.log(`Transcribing with model: ${modelName} (timeout ${AUDIO_TIMEOUT_MS / 1000}s)`);
+        const currentModel = genAI.getGenerativeModel({ model: modelName });
+        const contentPromise = currentModel.generateContent([
+          {
+            inlineData: {
+              mimeType: mimeType,
+              data: audioBase64
             }
+          },
+          { text: "Transcribe this audio and translate it to English. The audio may be in Punjabi, Hindi, or English. If the audio is in Punjabi or Hindi, translate it to English. If it's already in English, keep it in English. Return ONLY the English transcribed/translated text, nothing else. If the audio is unclear or empty, return an empty string." }
+        ]);
+        const timeoutPromise = new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("Transcription timeout")), AUDIO_TIMEOUT_MS)
+        );
+        transcriptionResult = await Promise.race([contentPromise, timeoutPromise]);
+        console.log(`Transcribed with model: ${modelName}`);
+        break;
+      } catch (error) {
+        const errorStatus = error?.status || error?.response?.status || error?.statusCode;
+        const errorMessage = String(error?.message || error?.toString() || '');
+        const isQuotaError = errorStatus === 429 ||
+                           Number(errorStatus) === 429 ||
+                           errorMessage.includes('429') ||
+                           errorMessage.includes('quota') ||
+                           errorMessage.includes('Too Many Requests') ||
+                           errorMessage.includes('exceeded your current quota');
 
-            console.log(`Quota error for ${modelName} - failing fast with retry delay info: ${retryDelaySeconds}s`);
-            // Store error with retry delay info and preserve status
-            error.retryDelaySeconds = retryDelaySeconds;
-            error.status = error.status || 429; // Ensure status is set
-            lastError = error;
-            break; // Exit retry loop, try next model or fail
+        if (isQuotaError) {
+          let retryDelaySeconds = 40;
+          if (error.errorDetails && Array.isArray(error.errorDetails)) {
+            const retryInfo = error.errorDetails.find(d => d['@type'] === 'type.googleapis.com/google.rpc.RetryInfo');
+            if (retryInfo?.retryDelay) {
+              const m = String(retryInfo.retryDelay).match(/(\d+(?:\.\d+)?)s?/);
+              if (m) retryDelaySeconds = Math.ceil(parseFloat(m[1]));
+            }
+          } else {
+            const m = errorMessage.match(/retry in ([\d.]+)s/i);
+            if (m) retryDelaySeconds = Math.ceil(parseFloat(m[1]));
           }
-
-          // If it's a 404 (model not found), try next model
-          if (errorStatus === 404) {
-            console.warn(`Model ${modelName} not found (404), trying next model`);
-            lastError = error;
-            break; // Exit retry loop, try next model
-          }
-
-          // Quota errors are already handled above, so this shouldn't be reached
-          // But keep it as a safety check
-
-          // For other errors, throw immediately
-          throw error;
+          error.retryDelaySeconds = retryDelaySeconds;
+          error.status = error.status || 429;
+          lastError = error;
+          break; // Fail fast on quota, don't try more models
         }
-      }
 
-      if (success) {
-        break; // Success, exit model loop
+        if (errorStatus === 404 || errorMessage.includes('not found') || errorMessage.includes('Transcription timeout')) {
+          console.warn(`Model ${modelName} failed (${errorMessage}), trying next`);
+          lastError = error;
+          continue;
+        }
+
+        lastError = error;
+        break; // Other errors: stop trying
       }
     }
 
@@ -631,6 +607,15 @@ app.post("/agent/audio", upload.single('audio'), async (req, res) => {
       });
     }
 
+    // Handle timeout (voice took too long)
+    if (errorMessage.includes('Transcription timeout') || errorMessage.includes('All models failed')) {
+      return res.status(408).json({
+        error: "Request timeout",
+        type: "CHAT",
+        ui: { text: "Voice request took too long. Please try a shorter recording or type your message." }
+      });
+    }
+
     // Handle model not found errors
     if (errorStatus === 404 || errorMessage.includes('not found') || errorMessage.includes('is not found')) {
       console.error("Model not found error:", error);
@@ -708,9 +693,50 @@ async function runAgent(session) {
       console.log(`Detected multiple fields in message, skipping fallback to let AI extract all fields`);
     }
 
+    // Detect when user is asking to fill a *different* field by name or for options (e.g. "i need to fill incident type", "give me option Police Called", "Incident Type")
+    // so we skip fallbacks and return ASK_FIELD with that field's options from the form (dynamic per form)
+    let userAskingToFillOtherField = false;
+    let requestedFieldForOptions = null; // when set, we'll return this field's options directly (no AI) so options are always from form definition
+    if (lastUserMessage) {
+      const trimmed = lastUserMessage.trim();
+      const msgLower = trimmed.toLowerCase();
+      const otherFields = session.lastAskedFieldId
+        ? session.formDefinition.filter(f => f.id !== session.lastAskedFieldId)
+        : session.formDefinition;
+
+      // Intent: "fill/show/choose/need/want" + field name, or "give me option(s)" + field name, or "option(s) for" + field name
+      const intentPhrases = /(?:fill|show|choose|want|need|give\s+me)\s+(?:to\s+)?(?:fill\s+)?(?:the\s+)?(?:option[s]?\s+)?/i.test(trimmed) || msgLower.includes(" fill ") || /\boption[s]?\s+for\s+/i.test(trimmed) || /\bgive\s+me\s+option[s]?\s+/i.test(trimmed);
+      const mentionsOtherField = otherFields.some(f => msgLower.includes(f.fieldName.toLowerCase()));
+
+      // Question-style: "what is the type of location types?", "what are the options for X?" – show options in chat
+      const questionAskingForOptions = /\b(what(?:'s| is)\s+(?:the\s+)?|what\s+are\s+the\s+option|which\s+option|type\s+of\s+|options?\s+for\s+|choices?\s+for\s+)/i.test(trimmed);
+      const mentionsFieldWithOptions = otherFields.some(f => {
+        const hasOptions = (f.fieldType === "DROPDOWN" && f.dropDownOptions?.length) || (f.fieldType === "CHECKBOX" && f.checkBoxOptions?.length) || (f.fieldType === "CHECKLIST" && f.checklistOptions?.length);
+        return hasOptions && msgLower.includes(f.fieldName.toLowerCase());
+      });
+
+      // Also: message is exactly or almost exactly a field's name (e.g. "Incident Type", "Police Called") - user wants that field
+      const isExactlyOtherFieldName = otherFields.some(f => {
+        const nameLower = f.fieldName.toLowerCase();
+        return msgLower === nameLower || msgLower.replace(/\s+/g, " ").trim() === nameLower;
+      });
+
+      userAskingToFillOtherField = (intentPhrases && mentionsOtherField) || isExactlyOtherFieldName || (questionAskingForOptions && mentionsFieldWithOptions);
+
+      // Resolve which field they asked for: match message to form field names (longest match = most specific)
+      if (userAskingToFillOtherField) {
+        const matchingFields = session.formDefinition.filter(f => msgLower.includes(f.fieldName.toLowerCase()));
+        requestedFieldForOptions = matchingFields.length > 0
+          ? matchingFields.sort((a, b) => b.fieldName.length - a.fieldName.length)[0]
+          : null;
+        console.log("User asked for options for a field - resolving from form:", requestedFieldForOptions ? requestedFieldForOptions.fieldName : "none", "- skipping fallbacks, returning that field's options dynamically");
+      }
+    }
+
     // AGGRESSIVE FALLBACK: If we asked about a field and user provided a substantial response, force SET_FIELD
     // BUT: Skip this if message contains multiple fields - let AI extract all of them
-    if (session.lastAskedFieldId && lastUserMessage && !hasMultipleFieldIndicators) {
+    // AND: Skip when user is asking to fill a *different* field (e.g. "i need to fill incident type") so they get dropdown in chat
+    if (session.lastAskedFieldId && lastUserMessage && !hasMultipleFieldIndicators && !userAskingToFillOtherField) {
       const lastAskedField = session.formDefinition.find(f => f.id === session.lastAskedFieldId);
       if (lastAskedField && !session.formState[session.lastAskedFieldId]) {
         // Check if message is a simple greeting/question word (exact match only, case insensitive)
@@ -857,6 +883,20 @@ async function runAgent(session) {
       }
     }
 
+    // Short-circuit: user asked for options for a specific field – return that field's options from the form (dynamic per form, no AI)
+    if (userAskingToFillOtherField && requestedFieldForOptions) {
+      session.lastAskedFieldId = requestedFieldForOptions.id;
+      const askResponse = buildAskResponse(requestedFieldForOptions, null);
+      return {
+        type: "CHAT",
+        ui: {
+          text: askResponse.chat,
+          options: askResponse.ui?.options || null,
+          type: askResponse.ui?.type || null
+        }
+      };
+    }
+
     const prompt = buildPrompt(session);
 
     const decision = await callGemini(prompt);
@@ -956,8 +996,8 @@ async function runAgent(session) {
     }
 
     // Secondary fallback: If AI still returned MESSAGE/ASK_FIELD but we have a lastAskedField, force SET_FIELD
-    // BUT: Skip this if message contains multiple fields - let AI extract all of them
-    if ((decision.action === "MESSAGE" || decision.action === "ASK_FIELD") && session.lastAskedFieldId && lastUserMessage && !hasMultipleFieldIndicators) {
+    // BUT: Skip if user was asking to fill a different field (e.g. "i need to fill incident type") or multiple fields
+    if ((decision.action === "MESSAGE" || decision.action === "ASK_FIELD") && session.lastAskedFieldId && lastUserMessage && !hasMultipleFieldIndicators && !userAskingToFillOtherField) {
       const lastAskedField = session.formDefinition.find(f => f.id === session.lastAskedFieldId);
       if (lastAskedField && !session.formState[session.lastAskedFieldId]) {
         const trimmedMessage = lastUserMessage.trim();
@@ -1423,15 +1463,22 @@ YOUR BEHAVIOR:
 10. IMPORTANT: User messages are ALREADY TRANSLATED TO ENGLISH - extract values in English for the form
 
 CRITICAL EXTRACTION RULES (HIGHEST PRIORITY - FOLLOW IN THIS ORDER):
-1. FIRST AND MOST IMPORTANT: Scan the ENTIRE LAST USER MESSAGE for ALL field information
-   - Look for field names mentioned: "chief name", "description", "date", "location", "cause", etc.
+0. HIGHEST PRIORITY - USER ASKS TO FILL A SPECIFIC FIELD (dropdown/checkbox in chat):
+   - If the user says they WANT TO FILL or CHOOSE a specific field BY NAME (e.g. "I want to fill incident type", "fill incident type", "I need to fill incident type", "show me incident type", "let me choose incident type", "can I fill incident type"), use ASK_FIELD for that field.
+   - Match the field name from FORM DEFINITION (e.g. "incident type" → "Incident Type"). Use the exact fieldId from FORM DEFINITION.
+   - The chat will then show the dropdown or checkbox options so the user can pick in the chat. Do NOT put the user's message into another field (e.g. do NOT fill Description with "i need to fill incident type").
+   - Example: User says "I want to fill incident type" → RESPONSE: { "action": "ASK_FIELD", "payload": { "fieldId": "<Incident Type field id from form>", "question": "Sure! Here are the options for Incident Type – pick one:" } }
+   - Example: User says "fill incident type" or "show incident type options" or "give me option Incident Type" or just "Incident Type" (meaning they want to pick that field) → same: use ASK_FIELD for Incident Type so the chat shows the dropdown options.
+
+1. FIRST: Scan the ENTIRE LAST USER MESSAGE for ALL field information (actual values, not "I want to fill X")
+   - Look for field names mentioned WITH values: "chief name is X", "description is Y", "date is Z"
    - If the message contains information for MULTIPLE fields, extract ALL of them
    - Return multiple SET_FIELD actions using the "actions" array format
    - Example: "Chief Name is Sukhman, Description is blah blah, date is today" → Extract ALL THREE fields
 
-2. SECOND: If message contains information for only ONE field, extract that field
+2. SECOND: If message contains information for only ONE field (a value), extract that field
    - Use LAST ASKED FIELD as context, but don't limit yourself to it
-   - If user mentions a field name explicitly, extract that field
+   - If user mentions a field name explicitly with a value, extract that field
 
 3. THIRD: If LAST ASKED FIELD exists and message is a simple answer (not mentioning multiple fields), use SET_FIELD for that field
 
@@ -1474,7 +1521,10 @@ PHASE 3 - Optional Fields (if user says yes):
 - Be less pushy - "Would you like to add [field name]?" or "Is there anything else you'd like to include?"
 
 ACTION RULES (IN ORDER OF PRIORITY):
-1. FIRST PRIORITY - SET_FIELD (can be multiple):
+0. HIGHEST PRIORITY - ASK_FIELD when user asks to fill a specific field by name (so chat shows dropdown/checkbox):
+   - If user says "I want to fill [field name]", "fill [field name]", "show me [field name] options", "I need to fill [field name]", use ASK_FIELD with that field's id so the UI shows options in the chat. Match [field name] to a field in FORM DEFINITION (e.g. "incident type" → Incident Type).
+
+1. SET_FIELD (can be multiple) - when user provides actual values:
    - ALWAYS scan the ENTIRE LAST USER MESSAGE first to find ALL field information
    - If user mentions MULTIPLE fields (e.g., "chief name is X, description is Y, date is Z"), extract ALL of them
    - Look for field names in the message and match them to FORM DEFINITION fields
@@ -1502,7 +1552,7 @@ ACTION RULES (IN ORDER OF PRIORITY):
      → { "action": "SET_FIELD", "payload": { "fieldId": "f2fb1543-c333-4803-9cdb-679530e66c32", "value": "Abhinav", "fieldLabel": "Fire Chief Name" } }
 
 2. ASK_FIELD: When you need to ask about a specific field - include a conversational "question" in payload
-   - Only use this when you're asking a NEW question, not after user provided a value
+   - Use when: (a) user asks to fill a specific field by name (e.g. "I want to fill incident type") so the chat shows dropdown/checkbox options, or (b) you're asking a NEW question. Include a short "question" so the reply is friendly; the UI will attach the options automatically.
 
 3. MESSAGE: For greetings, casual conversation, progress updates, asking about optional fields continuation
    - Use this for non-field-related conversation
@@ -1533,15 +1583,20 @@ For multiple fields at once (fill entire form in one go):
 }
 
 CRITICAL RULES (FOLLOW IN THIS ORDER):
-1. FIRST: If user provides a value (name, date, text, etc.), ALWAYS use SET_FIELD immediately - this is the highest priority
-2. After SET_FIELD, if there are still unfilled required fields, the backend will automatically ask about the next field
-3. When all required fields are filled for the first time, use ASK_OPTIONAL_CONTINUE
-4. If user says they want to continue with optional fields, start asking about them one by one
-5. If user says they want to submit, use CONFIRM_FORM
-6. Always use exact field IDs from FORM DEFINITION
-7. Be proactive - don't wait for the user, guide them through the process
+1. FIRST: If user says they want to fill a specific field by name (e.g. "I want to fill incident type"), use ASK_FIELD for that field so the chat shows dropdown/checkbox options – do NOT fill another field with their message.
+2. If user provides an actual value (name, date, text, option choice), use SET_FIELD immediately.
+3. After SET_FIELD, if there are still unfilled required fields, the backend will automatically ask about the next field
+4. When all required fields are filled for the first time, use ASK_OPTIONAL_CONTINUE
+5. If user says they want to continue with optional fields, start asking about them one by one
+6. If user says they want to submit, use CONFIRM_FORM
+7. Always use exact field IDs from FORM DEFINITION
+8. Be proactive - don't wait for the user, guide them through the process
 
 EXAMPLES OF CORRECT BEHAVIOR:
+- User says: "I want to fill incident type" or "fill incident type" or "I need to fill incident type" or "give me option Incident Type" or just "Incident Type"
+  → RESPONSE: { "action": "ASK_FIELD", "payload": { "fieldId": "<id of Incident Type in FORM DEFINITION>", "question": "Sure! Here are the options for Incident Type – pick one below:" } }
+  (Never put "Incident Type" or "give me option Incident Type" into the Description field.)
+  (The chat will then show the dropdown options so user can pick in the chat.)
 - User says: "Please fill the report, chief name Sukhamand, description blah blah blah"
   → RESPONSE: { "actions": [
       { "action": "SET_FIELD", "payload": { "fieldId": "chief-id", "value": "Sukhamand", "fieldLabel": "Fire Chief Name" } },
